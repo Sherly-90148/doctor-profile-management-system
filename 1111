@@ -1,0 +1,813 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+    getAuth, 
+    onAuthStateChanged,
+    setPersistence,
+    browserLocalPersistence,
+    createUserWithEmailAndPassword,
+    signInWithEmailAndPassword,
+    signOut,
+    signInAnonymously,
+} from 'firebase/auth';
+import { 
+    getFirestore, 
+    collection, 
+    addDoc, 
+    doc, 
+    updateDoc, 
+    deleteDoc, 
+    onSnapshot,
+    query,
+    where,
+    getDocs, // Import getDocs for checking duplicates
+    serverTimestamp,
+    setLogLevel
+} from 'firebase/firestore';
+import { LogIn, UserPlus, Shield, User, FileText, Award, CheckCircle, XCircle, Ban, RotateCw, PlusCircle, AlertTriangle, X, Eye, BookOpen, Trash2, Zap } from 'lucide-react';
+
+// --- Firebase Configuration ---
+// These variables should be provided by the environment.
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+let firebaseConfig;
+try {
+    firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+} catch (error) {
+    console.error("解析 Firebase 配置时出错:", error);
+    firebaseConfig = null;
+}
+
+// --- Main App Component ---
+const App = () => {
+    // State management for authentication and navigation
+    const [user, setUser] = useState(null); // Firebase auth user
+    const [userRole, setUserRole] = useState(null); // 'admin' or 'user'
+    const [page, setPage] = useState('login'); // 'login', 'admin', 'user'
+    const [isLoading, setIsLoading] = useState(true);
+    const [authReady, setAuthReady] = useState(false);
+    const [error, setError] = useState(null);
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+
+    // This effect initializes Firebase services
+    useEffect(() => {
+        if (!firebaseConfig) {
+            setError("Firebase 配置丢失或无效。请联系管理员。");
+            setIsLoading(false);
+            setAuthReady(true);
+            return;
+        }
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+            setDb(firestoreDb);
+            setAuth(firebaseAuth);
+            setLogLevel('debug');
+        } catch (initError) {
+            console.error("Firebase 初始化失败:", initError);
+            setError("应用初始化失败。");
+            setIsLoading(false);
+            setAuthReady(true);
+        }
+    }, []);
+
+    // This effect handles the authentication state
+    useEffect(() => {
+        if (!auth) {
+            if (authReady) setIsLoading(false);
+            return;
+        };
+
+        const unsubscribe = onAuthStateChanged(auth, (authUser) => {
+            if (authUser) {
+                setUser(authUser);
+            } else {
+                // No user is signed in. Create an anonymous session to allow database access.
+                signInAnonymously(auth).catch((err) => {
+                    console.error("Anonymous sign-in failed:", err);
+                    setError("无法建立安全会话，请刷新页面重试。");
+                });
+            }
+            setAuthReady(true);
+            setIsLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, [auth, authReady]);
+
+
+    // --- Navigation and Role Handling ---
+    const handleLogin = (role, newAuthUser) => {
+        if (newAuthUser) {
+            setUser(newAuthUser);
+        }
+        setUserRole(role);
+        setPage(role); 
+    };
+
+    const handleLogout = async () => {
+        // For admin, just reset UI state. For real user, sign out from Firebase.
+        if (auth && user && !user.isAnonymous) {
+            await signOut(auth);
+        }
+        setUserRole(null);
+        setPage('login');
+    };
+    
+    // --- Render correct page based on state ---
+    const renderPage = () => {
+        if (isLoading || !authReady) {
+            return <LoadingSpinner message="正在初始化应用..." />;
+        }
+        if (error) {
+            return <ErrorMessage message={error} />;
+        }
+
+        if (page === 'admin' && userRole === 'admin') {
+            return <AdminDashboard db={db} user={user} onLogout={handleLogout} />;
+        }
+        if (page === 'user' && userRole === 'user' && user && !user.isAnonymous) {
+            return <UserDashboard db={db} user={user} onLogout={handleLogout} />;
+        }
+        
+        return <LoginPage onLogin={handleLogin} auth={auth} />;
+    };
+
+    return (
+        <div className="min-h-screen bg-slate-100 font-sans">
+            {renderPage()}
+        </div>
+    );
+};
+
+
+// --- Login Page Component ---
+const LoginPage = ({ onLogin, auth }) => {
+    const [view, setView] = useState('main'); // 'main', 'admin', 'userLogin', 'userRegister'
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+    const [adminUsername, setAdminUsername] = useState('');
+    const [adminPassword, setAdminPassword] = useState('');
+    const [error, setError] = useState('');
+
+    const handleAdminSubmit = (e) => {
+        e.preventDefault();
+        setError('');
+        if (adminUsername === 'admin' && adminPassword === 'password123') {
+            onLogin('admin');
+        } else {
+            setError('管理员用户名或密码错误。');
+        }
+    };
+    
+    const handleUserLogin = async (e) => {
+        e.preventDefault();
+        setError('');
+        try {
+            const userCredential = await signInWithEmailAndPassword(auth, email, password);
+            onLogin('user', userCredential.user);
+        } catch (err) {
+            console.error("User login error:", err);
+            if (err.code === 'auth/operation-not-allowed') {
+                setError("登录失败：此登录方法未在您的 Firebase 项目中启用。请进入 Firebase 控制台，在 Authentication > Sign-in method 标签页中，启用“Email/Password”登录提供商。");
+            } else if (err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password') {
+                 setError("登录失败，请检查您的邮箱和密码。");
+            } else {
+                setError("登录失败，发生未知错误。");
+            }
+        }
+    };
+
+    const handleUserRegister = async (e) => {
+        e.preventDefault();
+        setError('');
+        if (password.length < 6) {
+            setError("密码长度不能少于6位。");
+            return;
+        }
+        try {
+            const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+            onLogin('user', userCredential.user);
+        } catch (err) {
+            console.error("User registration error:", err);
+            if (err.code === 'auth/email-already-in-use') {
+                setError("该邮箱已被注册。");
+            } else if (err.code === 'auth/operation-not-allowed') {
+                setError("注册失败：此登录方法未在您的 Firebase 项目中启用。请进入 Firebase 控制台，在 Authentication > Sign-in method 标签页中，启用“Email/Password”登录提供商。");
+            } else {
+                setError("注册失败，发生未知错误。");
+            }
+        }
+    };
+
+    const renderMainView = () => (
+        <div className="space-y-4">
+            <button onClick={() => setView('admin')} className="w-full flex items-center justify-center px-6 py-4 text-lg font-semibold text-white bg-sky-600 rounded-lg shadow-md hover:bg-sky-700 transition-transform transform hover:scale-105">
+                <Shield className="mr-3" />管理端登录
+            </button>
+            <button onClick={() => setView('userLogin')} className="w-full flex items-center justify-center px-6 py-4 text-lg font-semibold text-slate-800 bg-slate-200 rounded-lg shadow-md hover:bg-slate-300 transition-transform transform hover:scale-105">
+                <User className="mr-3" />用户端登录/注册
+            </button>
+        </div>
+    );
+
+    const renderAdminLogin = () => (
+        <form onSubmit={handleAdminSubmit} className="space-y-4 text-left">
+            <h2 className="text-xl font-semibold text-center text-slate-700">管理端登录</h2>
+            {error && <p className="text-sm text-red-600 text-center">{error}</p>}
+            <div>
+                <label className="block text-sm font-medium text-slate-600">用户名</label>
+                <input type="text" value={adminUsername} onChange={(e) => setAdminUsername(e.target.value)} className="w-full px-3 py-2 mt-1 border border-slate-300 rounded-md" placeholder="admin" />
+            </div>
+            <div>
+                <label className="block text-sm font-medium text-slate-600">密码</label>
+                <input type="password" value={adminPassword} onChange={(e) => setAdminPassword(e.target.value)} className="w-full px-3 py-2 mt-1 border border-slate-300 rounded-md" placeholder="password123" />
+            </div>
+            <div className="flex items-center gap-4 pt-2">
+                 <button type="button" onClick={() => { setView('main'); setError(''); }} className="w-full px-4 py-2 text-slate-700 bg-slate-100 rounded-md hover:bg-slate-200">返回</button>
+                <button type="submit" className="w-full px-4 py-2 font-semibold text-white bg-sky-600 rounded-md hover:bg-sky-700">登录</button>
+            </div>
+        </form>
+    );
+
+    const renderUserForms = (isRegister = false) => (
+        <form onSubmit={isRegister ? handleUserRegister : handleUserLogin} className="space-y-4 text-left">
+             <h2 className="text-xl font-semibold text-center text-slate-700">{isRegister ? '用户注册' : '用户登录'}</h2>
+            {error && (
+                <div className="p-3 my-2 text-sm text-red-700 bg-red-100 rounded-lg" role="alert">
+                    <span className="font-bold">操作失败：</span> {error}
+                </div>
+            )}
+            <div>
+                <label className="block text-sm font-medium text-slate-600">邮箱</label>
+                <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full px-3 py-2 mt-1 border border-slate-300 rounded-md" required />
+            </div>
+            <div>
+                <label className="block text-sm font-medium text-slate-600">密码</label>
+                <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} className="w-full px-3 py-2 mt-1 border border-slate-300 rounded-md" required />
+            </div>
+            <div className="pt-2">
+                 <button type="submit" className="w-full mb-2 px-4 py-2 font-semibold text-white bg-sky-600 rounded-md hover:bg-sky-700">{isRegister ? '注册' : '登录'}</button>
+                <button type="button" onClick={() => { setView(isRegister ? 'userLogin' : 'userRegister'); setError(''); }} className="w-full text-sm text-center text-sky-600 hover:underline">
+                    {isRegister ? '已有账户？前往登录' : '没有账户？前往注册'}
+                </button>
+            </div>
+             <button type="button" onClick={() => { setView('main'); setError(''); }} className="w-full mt-2 px-4 py-2 text-slate-700 bg-slate-100 rounded-md hover:bg-slate-200">返回主页</button>
+        </form>
+    );
+
+    const renderView = () => {
+        switch (view) {
+            case 'admin': return renderAdminLogin();
+            case 'userLogin': return renderUserForms(false);
+            case 'userRegister': return renderUserForms(true);
+            default: return renderMainView();
+        }
+    };
+    
+    return (
+        <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-sky-50 to-slate-200">
+            <div className="w-full max-w-md p-8 space-y-6 bg-white rounded-2xl shadow-2xl">
+                <h1 className="text-3xl font-bold text-center text-slate-800">医师档案管理系统</h1>
+                {renderView()}
+            </div>
+        </div>
+    );
+};
+
+// --- Admin Dashboard ---
+const AdminDashboard = ({ db, user, onLogout }) => {
+    const [doctors, setDoctors] = useState([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [selectedDoctor, setSelectedDoctor] = useState(null);
+    const [isDetailModalOpen, setIsDetailModalOpen] = useState(false);
+    const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+    const [filter, setFilter] = useState('all'); // 'all', 'unaudited', 'audited'
+    
+    const collectionPath = useMemo(() => `/artifacts/${appId}/public/data/doctors`, []);
+
+    useEffect(() => {
+        if (!db) {
+            setError("数据库未连接。");
+            setIsLoading(false);
+            return;
+        }
+        const q = query(collection(db, collectionPath));
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const docs = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+            setDoctors(docs);
+            setIsLoading(false);
+            setError(null);
+        }, (err) => {
+            console.error("获取医师列表失败:", err);
+            setError("无法加载医师数据。请检查数据库权限设置。");
+            setIsLoading(false);
+        });
+        return () => unsubscribe();
+    }, [db, collectionPath]);
+
+    const handleUpdateStatus = async (id, status) => {
+        const doctorRef = doc(db, collectionPath, id);
+        try {
+            await updateDoc(doctorRef, { status, reviewedBy: "admin", reviewedAt: serverTimestamp() });
+        } catch (e) {
+            console.error("更新状态失败: ", e);
+            alert("更新状态失败！");
+        }
+    };
+
+    const handleSaveNewProfile = async (data) => {
+        try {
+            // Check for duplicates before adding
+            const q = query(collection(db, collectionPath), where("name", "==", data.name.trim()));
+            const querySnapshot = await getDocs(q);
+            if (!querySnapshot.empty) {
+                alert("该医师已存在，不可重复录入。");
+                return;
+            }
+
+            await addDoc(collection(db, collectionPath), {
+                ...data,
+                status: 'approved', // Admin created profiles are auto-approved
+                createdBy: 'admin',
+                createdAt: serverTimestamp()
+            });
+            setIsAddModalOpen(false);
+        } catch (e) {
+            console.error("创建档案失败: ", e);
+            alert("创建档案失败！");
+        }
+    };
+    
+    const openDetailModal = (doctor) => {
+        setSelectedDoctor(doctor);
+        setIsDetailModalOpen(true);
+    };
+
+    const closeDetailModal = () => {
+        setSelectedDoctor(null);
+        setIsDetailModalOpen(false);
+    };
+
+    const filteredDoctors = useMemo(() => {
+        if (filter === 'all') return doctors;
+        if (filter === 'unaudited') return doctors.filter(d => d.status === 'pending');
+        if (filter === 'audited') return doctors.filter(d => d.status === 'approved' || d.status === 'rejected');
+        return doctors;
+    }, [doctors, filter]);
+
+    const FilterButton = ({ value, label }) => (
+        <button
+            onClick={() => setFilter(value)}
+            className={`px-4 py-2 text-sm font-medium rounded-md ${
+                filter === value 
+                ? 'bg-sky-600 text-white shadow' 
+                : 'bg-white text-slate-600 hover:bg-slate-100'
+            }`}
+        >
+            {label}
+        </button>
+    );
+
+    return (
+        <div className="p-4 md:p-8">
+            <header className="flex flex-col md:flex-row justify-between items-center mb-6">
+                <h1 className="text-2xl md:text-3xl font-bold text-slate-800 mb-4 md:mb-0">管理端面板</h1>
+                <div className="flex items-center gap-4">
+                    <button onClick={() => setIsAddModalOpen(true)} className="flex items-center bg-sky-600 hover:bg-sky-700 text-white font-semibold py-2 px-4 rounded-lg shadow-sm">
+                        <PlusCircle size={18} className="mr-2" />
+                        新增档案
+                    </button>
+                    <button onClick={onLogout} className="font-semibold text-sky-600 hover:text-sky-800">退出登录</button>
+                </div>
+            </header>
+
+            <div className="mb-4 flex items-center gap-2 p-2 bg-slate-100 rounded-lg">
+                <FilterButton value="all" label="全部" />
+                <FilterButton value="unaudited" label="未审核" />
+                <FilterButton value="audited" label="已审核" />
+            </div>
+            
+            <div className="bg-white rounded-lg shadow-md overflow-x-auto">
+                <table className="w-full text-sm text-left text-slate-500">
+                    <thead className="text-xs text-slate-700 uppercase bg-slate-100">
+                        <tr>
+                            <th scope="col" className="px-6 py-3">姓名</th>
+                            <th scope="col" className="px-6 py-3">科室</th>
+                            <th scope="col" className="px-6 py-3">提交日期</th>
+                            <th scope="col" className="px-6 py-3">状态</th>
+                            <th scope="col" className="px-6 py-3 text-center">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {isLoading && <tr><td colSpan="5"><LoadingSpinner message="加载中..." /></td></tr>}
+                        {error && <tr><td colSpan="5"><ErrorMessage message={error} /></td></tr>}
+                        {!isLoading && filteredDoctors.map(doctor => (
+                            <tr key={doctor.id} className="bg-white border-b hover:bg-slate-50">
+                                <td className="px-6 py-4 font-medium text-slate-900">{doctor.name}</td>
+                                <td className="px-6 py-4">{doctor.department}</td>
+                                <td className="px-6 py-4">{doctor.createdAt?.toDate ? doctor.createdAt.toDate().toLocaleDateString() : 'N/A'}</td>
+                                <td className="px-6 py-4">{getStatusChip(doctor.status)}</td>
+                                <td className="px-6 py-4 flex items-center justify-center gap-2 md:gap-4">
+                                    <button onClick={() => openDetailModal(doctor)} className="text-sky-600 hover:text-sky-800" title="查看详情"><Eye size={18} /></button>
+                                    {doctor.status === 'pending' && (
+                                        <>
+                                            <button onClick={() => handleUpdateStatus(doctor.id, 'approved')} className="text-green-600 hover:text-green-800" title="批准"><CheckCircle size={18} /></button>
+                                            <button onClick={() => handleUpdateStatus(doctor.id, 'rejected')} className="text-red-600 hover:text-red-800" title="拒绝"><XCircle size={18} /></button>
+                                        </>
+                                    )}
+                                    {doctor.status === 'approved' && (
+                                        <button onClick={() => handleUpdateStatus(doctor.id, 'pending')} className="text-amber-600 hover:text-amber-800" title="取消批准 (退回未审核)"><RotateCw size={18} /></button>
+                                    )}
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+            {isDetailModalOpen && <DoctorDetailModal doctor={selectedDoctor} onClose={closeDetailModal} db={db} collectionPath={collectionPath} />}
+            {isAddModalOpen && <ProfileFormModal isOpen={isAddModalOpen} onClose={() => setIsAddModalOpen(false)} onSave={handleSaveNewProfile} profile={null} isAdmin={true} />}
+        </div>
+    );
+};
+
+// --- User (Doctor) Dashboard ---
+const UserDashboard = ({ db, user, onLogout }) => {
+    const [profile, setProfile] = useState(null);
+    const [profileExists, setProfileExists] = useState(false);
+    const [isLoading, setIsLoading] = useState(true);
+    const [isFormOpen, setIsFormOpen] = useState(false);
+    
+    const collectionPath = useMemo(() => `/artifacts/${appId}/public/data/doctors`, []);
+    
+    useEffect(() => {
+        if (!user) return;
+        const q = query(collection(db, collectionPath), where("userId", "==", user.uid));
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            if (!snapshot.empty) {
+                const userProfile = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+                setProfile(userProfile);
+                setProfileExists(true);
+            } else {
+                setProfile(null);
+                setProfileExists(false);
+            }
+            setIsLoading(false);
+        }, (err) => {
+            console.error("获取档案失败: ", err);
+            setIsLoading(false);
+        });
+        return () => unsubscribe();
+    }, [db, user, collectionPath]);
+
+    const handleSaveProfile = async (data) => {
+        try {
+            if (profileExists) {
+                const profileRef = doc(db, collectionPath, profile.id);
+                await updateDoc(profileRef, { ...data, status: 'pending', updatedAt: serverTimestamp() });
+            } else {
+                // Check for duplicates before adding
+                const q = query(collection(db, collectionPath), where("name", "==", data.name.trim()));
+                const querySnapshot = await getDocs(q);
+                if (!querySnapshot.empty) {
+                    alert("该医师已存在，不可重复录入。");
+                    return;
+                }
+                
+                await addDoc(collection(db, collectionPath), { 
+                    ...data, 
+                    userId: user.uid, 
+                    status: 'pending', 
+                    createdAt: serverTimestamp() 
+                });
+            }
+            setIsFormOpen(false);
+        } catch (e) {
+            console.error("保存档案失败: ", e);
+            alert("保存档案失败！");
+        }
+    };
+    
+    if (isLoading) return <LoadingSpinner message="正在加载您的档案..."/>;
+
+    return (
+        <div className="p-4 md:p-8 max-w-4xl mx-auto">
+            <header className="flex flex-col md:flex-row justify-between items-center mb-6">
+                <h1 className="text-2xl md:text-3xl font-bold text-slate-800 mb-2 md:mb-0">我的医师档案</h1>
+                <button onClick={onLogout} className="font-semibold text-sky-600 hover:text-sky-800">退出登录</button>
+            </header>
+            
+            {profileExists ? (
+                <div className="bg-white p-6 rounded-lg shadow-md">
+                    <div className="flex justify-between items-start">
+                        <div>
+                            <h2 className="text-2xl font-bold text-slate-800">{profile.name}</h2>
+                            <p className="text-slate-500">{profile.title} - {profile.department}</p>
+                        </div>
+                        <div className="text-right flex-shrink-0 ml-4">
+                            <p className="text-sm text-slate-500">档案状态</p>
+                            {getStatusChip(profile.status)}
+                        </div>
+                    </div>
+                    <hr className="my-4" />
+                    <div className="space-y-6">
+                        <InfoSection title="执业信息" content={profile.practiceInfo} icon={FileText} />
+                        <SkillInfoSection title="技能操作证书" skills={profile.skillCertificates} />
+                        <InfoSection title="进修证明" content={profile.studyCertificates} icon={BookOpen} />
+                    </div>
+                    <div className="mt-6 text-right">
+                        <button onClick={() => setIsFormOpen(true)} className="bg-sky-600 text-white px-6 py-2 rounded-lg hover:bg-sky-700">编辑档案</button>
+                    </div>
+                </div>
+            ) : (
+                <div className="text-center bg-white p-10 rounded-lg shadow-md">
+                    <h2 className="text-2xl font-semibold text-slate-700">您尚未创建档案</h2>
+                    <p className="text-slate-500 mt-2 mb-6">请创建您的医师档案以供审核。</p>
+                    <button onClick={() => setIsFormOpen(true)} className="bg-sky-600 text-white px-6 py-3 rounded-lg hover:bg-sky-700 text-lg">创建我的档案</button>
+                </div>
+            )}
+            
+            {isFormOpen && (
+                <ProfileFormModal 
+                    isOpen={isFormOpen} 
+                    onClose={() => setIsFormOpen(false)} 
+                    onSave={handleSaveProfile} 
+                    profile={profile}
+                    isAdmin={false}
+                />
+            )}
+        </div>
+    );
+};
+
+// --- Reusable Components ---
+
+const getStatusChip = (status) => {
+    switch (status) {
+        case 'approved': return <span className="px-2 py-1 text-xs font-semibold text-green-800 bg-green-200 rounded-full">已批准</span>;
+        case 'rejected': return <span className="px-2 py-1 text-xs font-semibold text-red-800 bg-red-200 rounded-full">已拒绝</span>;
+        case 'suspended': return <span className="px-2 py-1 text-xs font-semibold text-slate-800 bg-slate-300 rounded-full">已暂停</span>;
+        case 'temporarily_authorized': return <span className="px-2 py-1 text-xs font-semibold text-purple-800 bg-purple-200 rounded-full">临时授权</span>;
+        case 'pending':
+        default: return <span className="px-2 py-1 text-xs font-semibold text-amber-800 bg-amber-200 rounded-full">待审核</span>;
+    }
+};
+
+const InfoSection = ({ title, content, icon: Icon }) => (
+    <div>
+        <h3 className="text-lg font-semibold text-slate-700 flex items-center mb-2">
+            <Icon className="mr-2 text-sky-600" size={20} />
+            {title}
+        </h3>
+        <p className="text-slate-600 whitespace-pre-wrap bg-slate-50 p-3 rounded-md border border-slate-200">{content || "未提供"}</p>
+    </div>
+);
+
+const SkillInfoSection = ({ title, skills }) => (
+     <div>
+        <h3 className="text-lg font-semibold text-slate-700 flex items-center mb-2">
+            <Award className="mr-2 text-sky-600" size={20} />
+            {title}
+        </h3>
+        <div className="bg-slate-50 p-3 rounded-md border border-slate-200 space-y-2">
+            {(skills && skills.length > 0) ? (
+                skills.map((skill, index) => (
+                    <div key={index} className="flex flex-col sm:flex-row justify-between sm:items-center">
+                        <div className='mb-1 sm:mb-0'>
+                           <p className="text-slate-800 font-medium">{skill.name}</p>
+                           <p className="text-xs text-slate-500">证书: {skill.path}</p>
+                        </div>
+                        {getStatusChip(skill.status)}
+                    </div>
+                ))
+            ) : (<p className="text-slate-500">未提供</p>)}
+        </div>
+    </div>
+);
+
+
+const DoctorDetailModal = ({ doctor, onClose, db, collectionPath }) => {
+
+    const handleSkillStatusChange = async (skillIndex, newStatus) => {
+        const currentSkills = doctor.skillCertificates || [];
+        const updatedSkills = [...currentSkills];
+        
+        updatedSkills[skillIndex] = {
+            ...updatedSkills[skillIndex],
+            status: newStatus,
+            reviewedBy: 'admin',
+            reviewedAt: serverTimestamp()
+        };
+
+        const doctorRef = doc(db, collectionPath, doctor.id);
+        const updates = { skillCertificates: updatedSkills };
+
+        if (newStatus === 'suspended' && doctor.status === 'approved') {
+            updates.status = 'pending';
+        }
+
+        try {
+            await updateDoc(doctorRef, updates);
+        } catch(e) {
+            console.error("更新技能状态失败:", e);
+            alert("操作失败！");
+        }
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+                <header className="p-4 border-b flex justify-between items-center sticky top-0 bg-white">
+                    <h2 className="text-xl font-bold">{doctor.name} 的详细档案</h2>
+                    <button onClick={onClose} className="text-slate-500 hover:text-slate-800"><X /></button>
+                </header>
+                <main className="p-6 overflow-y-auto space-y-6">
+                    <InfoSection title="基本信息" content={`科室: ${doctor.department}\n职称: ${doctor.title}`} icon={User} />
+                    <InfoSection title="执业信息" content={doctor.practiceInfo} icon={FileText} />
+                    
+                    <div>
+                        <h3 className="text-lg font-semibold text-slate-700 flex items-center mb-2">
+                            <Award className="mr-2 text-sky-600" size={20} />
+                            技能操作证书
+                        </h3>
+                        <div className="bg-slate-50 p-3 rounded-md border border-slate-200 space-y-3">
+                            {(doctor.skillCertificates && doctor.skillCertificates.length > 0) ? (
+                                doctor.skillCertificates.map((skill, index) => (
+                                    <div key={index} className="flex flex-col sm:flex-row justify-between sm:items-center gap-2">
+                                        <div className='flex-grow'>
+                                            <p className="text-slate-800 font-medium">{skill.name}</p>
+                                            <p className="text-xs text-slate-500 break-all">证书: {skill.path}</p>
+                                        </div>
+                                        <div className="flex items-center gap-4 flex-shrink-0">
+                                            {getStatusChip(skill.status)}
+                                            <div className="flex gap-2">
+                                                {(skill.status === 'pending' || skill.status === 'rejected') && (
+                                                    <button onClick={() => handleSkillStatusChange(index, 'temporarily_authorized')} className="text-purple-600 hover:text-purple-800" title="临时授权"><Zap size={18} /></button>
+                                                )}
+                                                {(skill.status === 'pending' || skill.status === 'rejected' || skill.status === 'temporarily_authorized') && (
+                                                    <>
+                                                        <button onClick={() => handleSkillStatusChange(index, 'approved')} className="text-green-600 hover:text-green-800" title="批准"><CheckCircle size={18} /></button>
+                                                        <button onClick={() => handleSkillStatusChange(index, 'rejected')} className="text-red-600 hover:text-red-800" title="拒绝"><XCircle size={18} /></button>
+                                                    </>
+                                                )}
+                                                {skill.status === 'approved' && (
+                                                    <button onClick={() => handleSkillStatusChange(index, 'suspended')} className="text-orange-500 hover:text-orange-700" title="暂停该技术"><Ban size={18} /></button>
+                                                )}
+                                                 {skill.status === 'suspended' && (
+                                                    <button onClick={() => handleSkillStatusChange(index, 'approved')} className="text-blue-500 hover:text-blue-700" title="恢复该技术"><RotateCw size={18} /></button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))
+                            ) : (<p className="text-slate-500">未提供</p>)}
+                        </div>
+                    </div>
+
+                    <InfoSection title="进修证明" content={doctor.studyCertificates} icon={BookOpen} />
+                </main>
+            </div>
+        </div>
+    );
+};
+
+
+const ProfileFormModal = ({ isOpen, onClose, onSave, profile, isAdmin }) => {
+    const [formData, setFormData] = useState({
+        name: profile?.name || '',
+        department: profile?.department || '',
+        title: profile?.title || '',
+        practiceInfo: profile?.practiceInfo || '',
+        skillCertificates: profile?.skillCertificates || [],
+        studyCertificates: profile?.studyCertificates || '',
+    });
+    const [newSkill, setNewSkill] = useState({ name: '', path: '' });
+
+    // This function was missing. Adding it back.
+    const handleChange = (e) => {
+        const { name, value } = e.target;
+        setFormData(prev => ({ ...prev, [name]: value }));
+    };
+
+    const handleFileChange = (e, fieldName) => {
+        const file = e.target.files[0];
+        if (file) {
+            setFormData(prev => ({ ...prev, [fieldName]: file.name }));
+        }
+    };
+    
+    const handleSkillFileChange = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+           setNewSkill(prev => ({ ...prev, path: file.name }));
+        }
+    };
+
+
+    const handleAddSkill = () => {
+        if (newSkill.name.trim() === '' || newSkill.path.trim() === '') {
+            alert("技能名称和证书均为必填项。");
+            return;
+        };
+        const skillToAdd = {
+            name: newSkill.name.trim(),
+            path: newSkill.path.trim(),
+            status: isAdmin ? 'approved' : 'pending',
+        };
+        setFormData(prev => ({
+            ...prev,
+            skillCertificates: [...prev.skillCertificates, skillToAdd]
+        }));
+        setNewSkill({ name: '', path: '' });
+        // Reset the file input visually
+        document.getElementById('skill-file-input').value = "";
+    };
+
+    const handleRemoveSkill = (indexToRemove) => {
+        setFormData(prev => ({
+            ...prev,
+            skillCertificates: prev.skillCertificates.filter((_, index) => index !== indexToRemove)
+        }));
+    };
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        onSave(formData);
+    };
+
+    if (!isOpen) return null;
+
+    const labelClass = "block text-sm font-medium text-slate-700 mb-1";
+    const inputClass = "w-full p-2 border border-slate-300 rounded-md focus:ring-sky-500 focus:border-sky-500";
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+            <form onSubmit={handleSubmit} className="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+                <header className="p-4 border-b sticky top-0 bg-white z-10">
+                    <h2 className="text-xl font-bold">{profile ? "编辑档案" : "创建档案"}</h2>
+                </header>
+                <main className="p-6 overflow-y-auto space-y-4">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div><label className={labelClass}>姓名*</label><input type="text" name="name" value={formData.name} onChange={handleChange} className={inputClass} required/></div>
+                        <div><label className={labelClass}>科室*</label><input type="text" name="department" value={formData.department} onChange={handleChange} className={inputClass} required/></div>
+                        <div className="md:col-span-2"><label className={labelClass}>职称*</label><input type="text" name="title" value={formData.title} onChange={handleChange} className={inputClass} required/></div>
+                    </div>
+                    <div><label className={labelClass}>执业信息*</label><textarea name="practiceInfo" value={formData.practiceInfo} onChange={handleChange} className={`${inputClass} min-h-[100px]`} required></textarea></div>
+                    
+                    <div>
+                        <label className={labelClass}>技能操作证书*</label>
+                        <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-2">
+                             <input type="text" value={newSkill.name} onChange={(e) => setNewSkill(prev => ({...prev, name: e.target.value}))} placeholder="输入技能名称" className={inputClass} />
+                             <input type="file" id="skill-file-input" onChange={handleSkillFileChange} className="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-sky-50 file:text-sky-700 hover:file:bg-sky-100" />
+                             {newSkill.path && <p className="text-xs text-slate-500">已选择: {newSkill.path}</p>}
+                             <button type="button" onClick={handleAddSkill} className="w-full mt-2 px-4 py-2 bg-sky-500 text-white rounded-md hover:bg-sky-600 flex-shrink-0">添加技能</button>
+                        </div>
+                        <div className="mt-2 space-y-2">
+                            {formData.skillCertificates.map((skill, index) => (
+                                <div key={index} className="flex items-center justify-between bg-slate-100 p-2 rounded-md">
+                                    <div>
+                                        <p className="font-medium">{skill.name}</p>
+                                        <p className="text-xs text-slate-500">证书: {skill.path}</p>
+                                    </div>
+                                    <button type="button" onClick={() => handleRemoveSkill(index)} className="text-red-500 hover:text-red-700"><Trash2 size={16} /></button>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+
+                    <div>
+                        <label className={labelClass}>进修结业证书*</label>
+                        <input type="file" onChange={(e) => handleFileChange(e, 'studyCertificates')} className="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-sky-50 file:text-sky-700 hover:file:bg-sky-100" required={!formData.studyCertificates}/>
+                        {formData.studyCertificates && <p className="text-xs text-slate-500 mt-1">已选择: {formData.studyCertificates}</p>}
+                    </div>
+                </main>
+                <footer className="p-4 border-t flex justify-end gap-3 bg-slate-50 sticky bottom-0">
+                    <button type="button" onClick={onClose} className="px-4 py-2 bg-slate-200 rounded-md hover:bg-slate-300">取消</button>
+                    <button type="submit" className="px-4 py-2 bg-sky-600 text-white rounded-md hover:bg-sky-700">保存</button>
+                </footer>
+            </form>
+        </div>
+    );
+};
+
+const LoadingSpinner = ({ message }) => (
+    <div className="flex items-center justify-center h-full p-10 text-slate-600">
+        <svg className="animate-spin -ml-1 mr-3 h-8 w-8 text-sky-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+        <p className="text-lg">{message}</p>
+    </div>
+);
+
+const ErrorMessage = ({ message }) => (
+    <div className="p-10 text-center">
+        <AlertTriangle className="mx-auto h-12 w-12 text-red-400" />
+        <h3 className="mt-2 text-lg font-medium text-red-800">发生错误</h3>
+        <p className="mt-1 text-sm text-red-700">{message}</p>
+    </div>
+);
+
+export default App;
